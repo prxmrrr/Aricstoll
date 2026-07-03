@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<!--
+  DUNGEON SURVEY — a procedural dungeon generator
+  ------------------------------------------------
+  Single self-contained file. No dependencies. Open it, hit Generate.
+
+  What's actually doing the work (the part worth talking about):
+    1. BSP  — binary space partition recursively carves the grid into rooms.
+    2. PRNG — a seeded generator (xmur3 + mulberry32). Same seed => same dungeon.
+    3. BFS  — flood fill verifies every floor tile is reachable, picks the exit
+              as the farthest tile from the entrance, and traces the solution.
+
+  Yours to extend (left intentionally undone):
+    - a player you can walk through it with arrow keys
+    - loot / enemy placement weighted by distance from entrance
+    - a second generator (cellular-automata caves) — the BFS check earns its keep
+      the moment a generator CAN produce disconnected regions
+    - difficulty scaling driven by path length / room count
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aricstoll</title>
+<meta name="description" content="Aricstoll — a procedurally generated roguelike. Descend torchlit dungeons by the light of your torch and race the clock.">
+<meta name="theme-color" content="#0e0c14">
+<meta property="og:title" content="Aricstoll">
+<meta property="og:description" content="A procedurally generated torchlit descent. Race the dark.">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%227%22%20fill%3D%22%230e0c14%22%2F%3E%3Cpath%20d%3D%22M16%205c1.4%204-1.4%206-3.4%208.6C11%2015.4%2010%2017%2010%2019a6%206%200%200%200%2012%200c0-2.6-1.4-4.4-2.8-6.2.7.5%201.6%201.2%202.2%202.2C22%2012%2021.5%208%2016%205z%22%20fill%3D%22%23f0a94e%22%2F%3E%3C%2Fsvg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0e0c14;          /* vault dark */
+    --stone:#15131b;        /* wall */
+    --panel:#1a1722;        /* bars */
+    --line:#2a2533;         /* hairlines */
+    --bone:#e9e3d6;         /* primary text */
+    --muted:#8a8294;        /* secondary text */
+    --torch:#f0a94e;        /* amber — entrance, primary accent */
+    --cold:#56d3c6;         /* teal — exit / solution */
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ height:100%; }
+  body{
+    background:var(--ink);
+    color:var(--bone);
+    font-family:'Space Mono',monospace;
+    display:flex; flex-direction:column; min-height:100vh;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* ---- top bar ---- */
+  .bar{
+    display:flex; flex-wrap:wrap; gap:20px 28px;
+    align-items:center; justify-content:space-between;
+    padding:20px clamp(16px,4vw,40px);
+    border-bottom:1px solid var(--line);
+    background:linear-gradient(var(--panel),var(--ink));
+  }
+  .brand{ display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  .brand .glyph{ color:var(--torch); display:inline-flex; align-items:center; transform:translateY(3px); }
+  .brand h1{
+    font-family:'Cinzel',serif; font-weight:600;
+    font-size:clamp(18px,2.4vw,26px); letter-spacing:.16em; text-transform:uppercase;
+  }
+  .brand .caption{
+    flex-basis:100%;
+    color:var(--muted); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+  }
+  .brand .caption b{ color:var(--bone); font-weight:400; }
+
+  /* ---- controls ---- */
+  .controls{ display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+  /* settings popover */
+  .settings-wrap{ position:relative; }
+  .btn.icon{ width:38px; padding:0; display:grid; place-items:center; color:var(--bone); }
+  .btn.icon[aria-expanded="true"]{ border-color:var(--torch); color:var(--torch); }
+  .settings{
+    position:absolute; right:0; top:calc(100% + 8px); z-index:120;
+    width:260px; max-width:calc(100vw - 32px);
+    background:var(--panel); border:1px solid var(--line); border-radius:3px;
+    padding:16px; box-shadow:0 24px 60px -28px #000;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  .settings[hidden]{ display:none; }
+  .settings h2{ font-family:'Cinzel',serif; font-weight:600; font-size:13px;
+    letter-spacing:.18em; text-transform:uppercase; color:var(--bone); }
+  .set-tabs{ display:flex; gap:4px; border-bottom:1px solid var(--line); margin:-4px 0 4px; }
+  .set-tab{ background:none; border:none; color:var(--muted); font-family:inherit;
+    font-size:11px; letter-spacing:.14em; text-transform:uppercase; padding:6px 8px 8px; cursor:pointer;
+    border-bottom:2px solid transparent; margin-bottom:-1px; }
+  .set-tab[aria-selected="true"]{ color:var(--bone); border-bottom-color:var(--torch); }
+  .set-panel{ display:flex; flex-direction:column; gap:10px; }
+  .set-panel[hidden]{ display:none; }
+  .set-label{ color:var(--muted); font-size:10px; letter-spacing:.16em; text-transform:uppercase; }
+  .seedrow{ display:flex; gap:8px; }
+  .seedrow #seed{
+    flex:1; min-width:0; background:var(--ink); border:1px solid var(--line); border-radius:2px;
+    color:var(--bone); font-family:inherit; font-size:13px; letter-spacing:.04em; padding:0 10px; height:36px;
+  }
+  .seedrow #seed::placeholder{ color:#4d4757; }
+  .seedrow #seed:focus{ outline:none; border-color:var(--torch); }
+  .seedrow .btn{ height:36px; padding:0 12px; }
+  .btn.wide{ width:100%; }
+  .settings .sizes{ width:100%; height:36px; }
+  .settings .sizes button{ flex:1; width:auto; }
+  .set-toggle{ display:flex; align-items:center; gap:9px; cursor:pointer;
+    color:var(--bone); font-size:12px; letter-spacing:.02em; }
+  .set-toggle input{ accent-color:var(--torch); width:15px; height:15px; cursor:pointer; }
+  .set-toggle b{ color:var(--torch); font-weight:700; }
+  .ctl{ display:flex; justify-content:space-between; gap:16px; align-items:baseline; }
+  .ctl-k{ color:var(--muted); font-size:10px; letter-spacing:.14em; text-transform:uppercase; }
+  .ctl-v{ color:var(--bone); font-size:12px; text-align:right; }
+  .settings .note{ color:var(--muted); font-size:11px; line-height:1.5; }
+
+  .sizes{ display:flex; border:1px solid var(--line); border-radius:2px; overflow:hidden; height:38px; }
+  .sizes button{ background:var(--ink); color:var(--muted); border:none; border-left:1px solid var(--line);
+    font-family:inherit; font-size:12px; width:34px; cursor:pointer; }
+  .sizes button:first-child{ border-left:none; }
+  .sizes button[aria-pressed="true"]{ background:var(--bone); color:var(--ink); }
+
+  button{ cursor:pointer; }
+  .btn{
+    height:38px; padding:0 16px; border-radius:2px;
+    font-family:inherit; font-size:12px; letter-spacing:.1em; text-transform:uppercase;
+    border:1px solid var(--line); background:var(--ink); color:var(--bone);
+    transition:border-color .15s, color .15s, background .15s;
+  }
+  .btn:hover{ border-color:var(--muted); }
+  .btn.primary{ background:var(--torch); color:#1a0f00; border-color:var(--torch); font-weight:700; }
+  .btn.primary:hover{ filter:brightness(1.08); }
+  .btn[aria-pressed="true"]{ border-color:var(--cold); color:var(--cold); }
+  :focus-visible{ outline:2px solid var(--torch); outline-offset:2px; }
+
+  /* ---- stage ---- */
+  main{ flex:1; display:grid; place-items:center; padding:clamp(16px,4vw,40px); }
+  .frame{ position:relative; }
+  canvas{ display:block; image-rendering:pixelated; border:1px solid var(--line);
+    box-shadow:0 30px 80px -40px #000, inset 0 0 0 1px #0006; max-width:100%; }
+  /* corner ticks — survey marginalia */
+  .frame::before,.frame::after{ content:''; position:absolute; width:10px; height:10px; pointer-events:none; }
+  .frame::before{ top:-1px; left:-1px; border-top:2px solid var(--torch); border-left:2px solid var(--torch); }
+  .frame::after{ bottom:-1px; right:-1px; border-bottom:2px solid var(--torch); border-right:2px solid var(--torch); }
+
+  /* ---- readout strip ---- */
+  .readout{
+    display:flex; flex-wrap:wrap; gap:6px 28px; justify-content:center;
+    padding:14px clamp(16px,4vw,40px);
+    border-top:1px solid var(--line); background:var(--panel);
+    font-size:12px; letter-spacing:.04em;
+  }
+  .readout .cell{ display:flex; gap:8px; align-items:baseline; }
+  .readout .k{ color:var(--muted); text-transform:uppercase; font-size:10px; letter-spacing:.16em; }
+  .readout .v{ color:var(--bone); }
+  .readout .v.ok{ color:var(--cold); }
+  .readout .swatch{ width:9px; height:9px; display:inline-block; border-radius:50%; transform:translateY(1px); }
+  .sw-in{ background:var(--torch); }
+  .sw-out{ background:var(--cold); }
+
+  .timer{
+    position:absolute; top:10px; right:12px; z-index:5;
+    font-family:'Space Mono',monospace; font-weight:700; font-size:16px; letter-spacing:.04em;
+    color:var(--torch); background:color-mix(in srgb, var(--ink) 68%, transparent);
+    border:1px solid var(--line); border-radius:2px; padding:5px 10px;
+    font-variant-numeric:tabular-nums; pointer-events:none;
+  }
+
+  .win{
+    position:absolute; inset:0; display:grid; place-content:center; gap:14px; text-align:center;
+    background:color-mix(in srgb, var(--ink) 78%, transparent);
+    backdrop-filter:blur(2px); animation:winIn .25s ease;
+  }
+  .win[hidden]{ display:none; }
+  .win-tag{ font-family:'Cinzel',serif; font-weight:600; font-size:clamp(22px,5vw,38px);
+    letter-spacing:.14em; text-transform:uppercase; color:var(--cold); }
+  .win-stat{ color:var(--bone); font-size:13px; letter-spacing:.04em; }
+  .win-stat b{ color:var(--torch); font-variant-numeric:tabular-nums; }
+  .win-best{ color:var(--torch); font-size:12px; letter-spacing:.18em; text-transform:uppercase; }
+  .win-best[hidden]{ display:none; }
+  .win .btn{ justify-self:center; }
+  @keyframes winIn{ from{ opacity:0; transform:scale(.96); } to{ opacity:1; transform:none; } }
+
+  @media (max-width:560px){
+    .controls{ width:100%; }
+    #pathBtn, #randBtn{ flex:1; }
+  }
+</style>
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <span class="glyph" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+          <path d="M12 2c1 3-1 4.5-2.5 6.5C8 10.5 7 12 7 14a5 5 0 0 0 10 0c0-2.2-1.2-3.7-2.4-5.2.6.4 1.4 1 1.9 1.9C16 8 16 5 12 2zm0 18a3 3 0 0 1-3-3c0-1.3.8-2.3 1.6-3.2.3 1 .9 1.6 1.7 1.8.9.2 1.5-.4 1.6-1.1.7.8 1.1 1.6 1.1 2.5a3 3 0 0 1-3 3z"/>
+        </svg>
+      </span>
+      <h1>Aricstoll</h1>
+      <p class="caption">A procedurally generated descent &middot; <b>race the dark</b></p>
+    </div>
+    <div class="controls">
+      <button id="pathBtn" class="btn" aria-pressed="false">Show path</button>
+      <button id="randBtn" class="btn primary">New run</button>
+      <div class="settings-wrap">
+        <button id="setBtn" class="btn icon" aria-haspopup="true" aria-expanded="false" aria-label="Settings">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+        <div class="settings" id="settings" role="dialog" aria-label="Settings" hidden>
+          <div class="set-tabs" role="tablist">
+            <button class="set-tab" id="tabRun" role="tab" aria-selected="true" aria-controls="panelRun">Run</button>
+            <button class="set-tab" id="tabControls" role="tab" aria-selected="false" aria-controls="panelControls">Controls</button>
+          </div>
+
+          <div class="set-panel" id="panelRun" role="tabpanel" aria-labelledby="tabRun">
+            <p class="set-label" id="seedLabel">Seed</p>
+            <div class="seedrow">
+              <input id="seed" type="text" placeholder="random" autocomplete="off" spellcheck="false" aria-labelledby="seedLabel">
+              <button id="copyBtn" class="btn">Copy</button>
+            </div>
+            <button id="genBtn" class="btn primary wide">Generate this seed</button>
+
+            <p class="set-label">View</p>
+            <div class="sizes" role="group" aria-label="Zoom">
+              <button data-size="s" aria-pressed="true">S</button>
+              <button data-size="m">M</button>
+              <button data-size="l">L</button>
+            </div>
+            <label class="set-toggle">
+              <input type="checkbox" id="zoomUnlock">
+              <span>Let <b>E</b> change zoom while playing</span>
+            </label>
+            <p class="note">The same seed makes the same run, floor for floor.</p>
+          </div>
+
+          <div class="set-panel" id="panelControls" role="tabpanel" aria-labelledby="tabControls" hidden>
+            <div class="ctl"><span class="ctl-k">Move</span><span class="ctl-v">Arrows / WASD / swipe</span></div>
+            <div class="ctl"><span class="ctl-k">Zoom</span><span class="ctl-v">E &nbsp;(enable in Run)</span></div>
+            <div class="ctl"><span class="ctl-k">Descend</span><span class="ctl-v">reach the exit</span></div>
+            <div class="ctl"><span class="ctl-k">Pause</span><span class="ctl-v">P or Esc</span></div>
+            <div class="ctl"><span class="ctl-k">Show path</span><span class="ctl-v">hint button, top bar</span></div>
+            <div class="ctl"><span class="ctl-k">New run</span><span class="ctl-v">button, top bar</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="frame">
+      <canvas id="map" role="img" aria-label="Generated dungeon map"></canvas>
+      <div class="timer" id="timer" aria-label="Run time">0:00.00</div>
+      <div class="win" id="winCard" hidden>
+        <p class="win-tag" id="winTag">Escaped</p>
+        <p class="win-stat"><b id="winSteps">0</b> steps &middot; optimal <b id="winOptimal">0</b></p>
+        <p class="win-stat">time <b id="winTime">0:00.00</b> &middot; best <b id="winBest">—</b></p>
+        <p class="win-best" id="winBestNote" hidden>★ New best</p>
+        <button class="btn primary" id="winPlay">Play again</button>
+      </div>
+      <div class="win" id="pauseCard" hidden>
+        <p class="win-tag" style="color:var(--torch)">Paused</p>
+        <p class="win-stat">time <b id="pauseTime">0:00.00</b></p>
+        <button class="btn primary" id="resumeBtn">Resume</button>
+        <button class="btn" id="pauseNew">New run</button>
+      </div>
+    </div>
+  </main>
+
+  <footer class="readout">
+    <div class="cell"><span class="k">depth</span><span class="v" id="rDepth">1</span></div>
+    <div class="cell"><span class="k">grid</span><span class="v" id="rGrid">—</span></div>
+    <div class="cell"><span class="k">rooms</span><span class="v" id="rRooms">—</span></div>
+    <div class="cell"><span class="k">path</span><span class="v" id="rPath">—</span></div>
+    <div class="cell"><span class="k">steps</span><span class="v" id="rSteps">—</span></div>
+    <div class="cell"><span class="swatch sw-in"></span><span class="k">entrance</span></div>
+    <div class="cell"><span class="swatch sw-out"></span><span class="k">exit</span></div>
+  </footer>
+
+<script>
+//==============================================================
+//  1. SEEDED RANDOMNESS
+//  xmur3 hashes a string into a 32-bit seed; mulberry32 turns
+//  that into a fast deterministic stream of floats in [0,1).
+//==============================================================
+function xmur3(str){
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++){
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  return function(){
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    return (h ^= h >>> 16) >>> 0;
+  };
+}
+function mulberry32(a){
+  return function(){
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+//==============================================================
+//  2. GENERATION (BSP)
+//==============================================================
+const WALL = 0, ROOM = 1, CORR = 2;
+const SIZES = { s:[33,23], m:[49,33], l:[65,45] };
+const MIN_PART = 8;   // a region edge must be >= 2*MIN_PART to split on that axis
+const MIN_ROOM = 4;   // smallest room edge
+const MAX_DEPTH = 5;  // caps room count / keeps rooms from getting tiny
+
+let rng, grid, rooms, cols, rowsN;
+
+function generate(seedStr, dims){
+  rng = mulberry32(xmur3(seedStr)());
+  [cols, rowsN] = dims;
+  grid = Array.from({length:rowsN}, () => new Array(cols).fill(WALL));
+  rooms = [];
+  buildTree({ x:1, y:1, w:cols-2, h:rowsN-2 }, 0);
+
+  const entrance = { x:rooms[0].cx, y:rooms[0].cy };
+  // BFS from the entrance: reachability, plus distances to choose the exit.
+  const bfs = floodFrom(entrance);
+  const exit = bfs.farthest;
+  const path = tracePath(bfs.parent, entrance, exit);
+
+  return {
+    seed:seedStr, cols, rowsN, grid, rooms,
+    entrance, exit, path,
+    reachable: bfs.visited / bfs.total,
+  };
+}
+
+function buildTree(region, depth){
+  const node = { ...region, depth, connector:null };
+  const canH = region.h >= MIN_PART * 2;   // split top / bottom
+  const canV = region.w >= MIN_PART * 2;   // split left / right
+
+  if (depth < MAX_DEPTH && (canH || canV)){
+    let horizontal;
+    if (canH && !canV) horizontal = true;
+    else if (canV && !canH) horizontal = false;
+    else if (region.w > region.h * 1.2) horizontal = false;  // split the longer axis
+    else if (region.h > region.w * 1.2) horizontal = true;
+    else horizontal = rng() < 0.5;
+
+    let left, right;
+    if (horizontal){
+      const cut = (region.y + MIN_PART) + Math.floor(rng() * (region.h - MIN_PART * 2 + 1));
+      left  = buildTree({ x:region.x, y:region.y, w:region.w, h:cut - region.y }, depth + 1);
+      right = buildTree({ x:region.x, y:cut, w:region.w, h:region.y + region.h - cut }, depth + 1);
+    } else {
+      const cut = (region.x + MIN_PART) + Math.floor(rng() * (region.w - MIN_PART * 2 + 1));
+      left  = buildTree({ x:region.x, y:region.y, w:cut - region.x, h:region.h }, depth + 1);
+      right = buildTree({ x:cut, y:region.y, w:region.x + region.w - cut, h:region.h }, depth + 1);
+    }
+    // Connecting the two halves at every merge guarantees the whole tree is connected.
+    connect(left.connector, right.connector);
+    node.connector = (rng() < 0.5 ? left : right).connector;
+  } else {
+    const room = carveRoom(region);
+    node.connector = { x:room.cx, y:room.cy };
+  }
+  return node;
+}
+
+function carveRoom(region){
+  const maxW = Math.max(MIN_ROOM, region.w - 2);
+  const maxH = Math.max(MIN_ROOM, region.h - 2);
+  const rw = MIN_ROOM + Math.floor(rng() * (maxW - MIN_ROOM + 1));
+  const rh = MIN_ROOM + Math.floor(rng() * (maxH - MIN_ROOM + 1));
+  const rx = region.x + 1 + Math.floor(rng() * Math.max(1, region.w - rw - 1));
+  const ry = region.y + 1 + Math.floor(rng() * Math.max(1, region.h - rh - 1));
+  for (let y = ry; y < ry + rh; y++)
+    for (let x = rx; x < rx + rw; x++)
+      grid[y][x] = ROOM;
+  const room = { x:rx, y:ry, w:rw, h:rh, cx:rx + (rw >> 1), cy:ry + (rh >> 1), index:rooms.length };
+  rooms.push(room);
+  return room;
+}
+
+function carve(x, y){ if (grid[y]?.[x] === WALL) grid[y][x] = CORR; }
+function hCorr(x1, x2, y){ for (let x = Math.min(x1,x2); x <= Math.max(x1,x2); x++) carve(x,y); }
+function vCorr(y1, y2, x){ for (let y = Math.min(y1,y2); y <= Math.max(y1,y2); y++) carve(x,y); }
+function connect(a, b){
+  if (rng() < 0.5){ hCorr(a.x, b.x, a.y); vCorr(a.y, b.y, b.x); }
+  else            { vCorr(a.y, b.y, a.x); hCorr(a.x, b.x, b.y); }
+}
+
+//==============================================================
+//  3. BFS — reachability, farthest tile (exit), shortest path
+//==============================================================
+const walkable = (x,y) => grid[y]?.[x] === ROOM || grid[y]?.[x] === CORR;
+const key = (x,y) => y * cols + x;
+
+function floodFrom(start){
+  const dist = new Map(), parent = new Map();
+  const q = [start];
+  dist.set(key(start.x,start.y), 0);
+  let total = 0;
+  for (let y=0;y<rowsN;y++) for (let x=0;x<cols;x++) if (walkable(x,y)) total++;
+  let farthest = start, far = 0, head = 0;
+  while (head < q.length){
+    const c = q[head++], d = dist.get(key(c.x,c.y));
+    if (d > far){ far = d; farthest = c; }
+    for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx = c.x+dx, ny = c.y+dy, k = key(nx,ny);
+      if (walkable(nx,ny) && !dist.has(k)){
+        dist.set(k, d+1); parent.set(k, c); q.push({x:nx,y:ny});
+      }
+    }
+  }
+  return { dist, parent, visited:dist.size, total, farthest, maxDist:far };
+}
+
+function tracePath(parent, start, end){
+  const path = []; let c = end;
+  while (c && !(c.x===start.x && c.y===start.y)){ path.push(c); c = parent.get(key(c.x,c.y)); }
+  path.push(start);
+  return path.reverse();
+}
+
+//==============================================================
+//  4. RENDER  (the reveal floods outward from the entrance —
+//   the same BFS distance map drives the animation, so what you
+//   watch IS the algorithm carving the dungeon out of the stone.)
+//==============================================================
+const C = {
+  stone:'#15131b', room:'#2d2835', corr:'#221e2a',
+  warm:'#3b2f2c', grid:'rgba(233,227,214,0.03)',
+  torch:'#f0a94e', cold:'#56d3c6',
+};
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+let current = null, cell = 12, revealMap = null, distRef = null;
+let player = null, steps = 0, won = false;   // play state
+let depth = 1, baseSeed = '', seen = new Set(), fog = true;  // roguelike state
+let pr = { x:0, y:0 }, cam = { x:0, y:0 }, litSet = new Set();   // render position + camera
+let VIEW_W = 960, VIEW_H = 600, revealStart = null;             // fixed window
+const ZOOM = { s:20, m:30, l:44 };   // S/M/L = tiles across the window (zoom, not dungeon size)
+const BASE_DIMS = [41, 27];          // starting floor; grows with depth only
+const VIS_R = 4.2;   // torchlight radius, in tiles
+
+function measure(){                       // lock the on-screen window; zoom changes cell, not the window
+  VIEW_W = Math.min(window.innerWidth - 48, 1040);
+  VIEW_H = Math.max(360, Math.min(Math.round(VIEW_W * 0.6), window.innerHeight - 230));
+  cell = computeCell();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = VIEW_W + 'px'; canvas.style.height = VIEW_H + 'px';
+  canvas.width = Math.round(VIEW_W * dpr); canvas.height = Math.round(VIEW_H * dpr);
+}
+function computeCell(){
+  if (!current) return 16;
+  if (fog) return Math.max(8, Math.floor(VIEW_W / ZOOM[size]));                                   // play: S/M/L zoom
+  return Math.max(4, Math.floor(Math.min(VIEW_W / current.cols, VIEW_H / current.rowsN)));        // survey: fit the whole map
+}
+function camTarget(){                     // where the camera wants to be (world px, top-left)
+  const worldW = current.cols * cell, worldH = current.rowsN * cell;
+  let tx = (pr.x + 0.5) * cell - VIEW_W / 2;
+  let ty = (pr.y + 0.5) * cell - VIEW_H / 2;
+  if (!fog){ tx = (worldW - VIEW_W) / 2; ty = (worldH - VIEW_H) / 2; }
+  tx = worldW <= VIEW_W ? (worldW - VIEW_W) / 2 : Math.max(0, Math.min(tx, worldW - VIEW_W));
+  ty = worldH <= VIEW_H ? (worldH - VIEW_H) / 2 : Math.max(0, Math.min(ty, worldH - VIEW_H));
+  return { x: tx, y: ty };
+}
+
+function lerp(a,b,t){ return a + (b-a)*t; }
+function mix(c1,c2,t){ // hex mix
+  const a = parseInt(c1.slice(1),16), b = parseInt(c2.slice(1),16);
+  const r = Math.round(lerp((a>>16)&255,(b>>16)&255,t));
+  const g = Math.round(lerp((a>>8)&255,(b>>8)&255,t));
+  const bl= Math.round(lerp(a&255,b&255,t));
+  return `rgb(${r},${g},${bl})`;
+}
+
+// Mark tiles within torchlight of the player as seen; store + return the lit set.
+function reveal(){
+  litSet = new Set();
+  const r2 = VIS_R * VIS_R;
+  const x0 = Math.max(0, Math.floor(player.x - VIS_R)), x1 = Math.min(cols-1, Math.ceil(player.x + VIS_R));
+  const y0 = Math.max(0, Math.floor(player.y - VIS_R)), y1 = Math.min(rowsN-1, Math.ceil(player.y + VIS_R));
+  for (let y=y0;y<=y1;y++) for (let x=x0;x<=x1;x++){
+    const dx = x-player.x, dy = y-player.y;
+    if (dx*dx + dy*dy <= r2){ const k = key(x,y); litSet.add(k); seen.add(k); }
+  }
+  return litSet;
+}
+
+function drawSurvey(d, progress, showPath){
+  for (let y=0;y<d.rowsN;y++){
+    for (let x=0;x<d.cols;x++){
+      const t = d.grid[y][x];
+      if (t === WALL) continue;
+      const a = Math.min(1, Math.max(0, (progress - revealMap[y][x]) / 0.05));
+      if (a <= 0) continue;
+      const dd = distRef.dist.get(key(x,y)) ?? distRef.maxDist;
+      const warmth = (1 - dd / (distRef.maxDist || 1)) * 0.5;   // torchlight near the entrance
+      const base = t === ROOM ? mix(C.room, C.warm, warmth) : C.corr;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = base;
+      ctx.fillRect(x*cell, y*cell, cell, cell);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  if (cell >= 9){
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x=0;x<=d.cols;x++){ ctx.moveTo(x*cell+.5,0); ctx.lineTo(x*cell+.5,d.rowsN*cell); }
+    for (let y=0;y<=d.rowsN;y++){ ctx.moveTo(0,y*cell+.5); ctx.lineTo(d.cols*cell,y*cell+.5); }
+    ctx.stroke();
+  }
+
+  if (showPath && progress >= 0.82){
+    const pa = Math.min(1,(progress-0.82)/0.18), n = Math.floor(d.path.length * pa);
+    ctx.fillStyle = C.cold; ctx.globalAlpha = 0.16;
+    for (let i=0;i<n;i++){ const p = d.path[i]; ctx.fillRect(p.x*cell, p.y*cell, cell, cell); }
+    ctx.globalAlpha = 1;
+  }
+
+  marker(d.entrance, C.torch, Math.min(1, progress/0.1));
+  if (progress >= 0.8) marker(d.exit, C.cold, Math.min(1,(progress-0.8)/0.12));
+  if (progress > 0.05) drawPlayer(pr.x, pr.y);
+}
+
+function drawPlayer(px, py){
+  const cx = px*cell + cell/2, cy = py*cell + cell/2;
+  const glow = ctx.createRadialGradient(cx,cy,0,cx,cy,cell*2.2);
+  glow.addColorStop(0,'rgba(233,227,214,0.42)'); glow.addColorStop(1,'rgba(233,227,214,0)');
+  ctx.fillStyle = glow; ctx.fillRect(cx-cell*2.2, cy-cell*2.2, cell*4.4, cell*4.4);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(cx, cy, cell*0.34, 0, Math.PI*2); ctx.fill();
+  ctx.lineWidth = Math.max(1, cell*0.06); ctx.strokeStyle = '#0009'; ctx.stroke();
+}
+
+function drawFog(d, showPath){
+  const x0 = Math.max(0, Math.floor(cam.x / cell)), x1 = Math.min(d.cols-1, Math.ceil((cam.x + VIEW_W) / cell));
+  const y0 = Math.max(0, Math.floor(cam.y / cell)), y1 = Math.min(d.rowsN-1, Math.ceil((cam.y + VIEW_H) / cell));
+  for (let y=y0;y<=y1;y++){
+    for (let x=x0;x<=x1;x++){
+      const k = key(x,y);
+      if (!seen.has(k)) continue;                     // never seen => stays void
+      const t = d.grid[y][x], isLit = litSet.has(k);
+      let col;
+      if (t === WALL)      col = isLit ? C.stone : '#100e16';
+      else if (isLit){
+        const dd = Math.hypot(x - pr.x, y - pr.y);
+        const warm = Math.max(0, 1 - dd/VIS_R) * 0.5;
+        col = t === ROOM ? mix(C.room, C.warm, warm) : C.corr;
+      }
+      else col = t === ROOM ? '#211d28' : '#191622';  // remembered, out of the light
+      ctx.fillStyle = col;
+      ctx.fillRect(x*cell, y*cell, cell, cell);
+    }
+  }
+
+  if (showPath){                                      // hint, only across tiles you've seen
+    ctx.fillStyle = C.cold; ctx.globalAlpha = 0.16;
+    for (const p of d.path) if (seen.has(key(p.x,p.y))) ctx.fillRect(p.x*cell,p.y*cell,cell,cell);
+    ctx.globalAlpha = 1;
+  }
+
+  marker(d.entrance, C.torch, 1);
+  if (seen.has(key(d.exit.x,d.exit.y))) marker(d.exit, C.cold, 1);
+  drawPlayer(pr.x, pr.y);
+}
+
+function marker(p, color, pop){
+  const cx = p.x*cell + cell/2, cy = p.y*cell + cell/2, r = cell*0.42*pop;
+  const glow = ctx.createRadialGradient(cx,cy,0,cx,cy,cell*2.4);
+  glow.addColorStop(0, color+'55'); glow.addColorStop(1, color+'00');
+  ctx.fillStyle = glow;
+  ctx.fillRect(cx-cell*2.4, cy-cell*2.4, cell*4.8, cell*4.8);
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+}
+
+//==============================================================
+//  5. ANIMATION + WIRING
+//==============================================================
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let raf = 0;
+
+function drawWorld(progress){
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = fog ? '#070509' : C.stone;     // window background (void / stone)
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.save();
+  ctx.translate(-cam.x, -cam.y);                 // camera
+  if (fog) drawFog(current, showPath);
+  else drawSurvey(current, progress, showPath);
+  ctx.restore();
+}
+
+function animate(){
+  const tgt = camTarget();
+  const f  = reduceMotion ? 1 : 0.32;            // token glide
+  const cf = reduceMotion ? 1 : 0.22;            // camera glide
+  pr.x += (player.x - pr.x) * f;
+  pr.y += (player.y - pr.y) * f;
+  cam.x += (tgt.x - cam.x) * cf;
+  cam.y += (tgt.y - cam.y) * cf;
+
+  let progress = 1;
+  if (!fog && revealStart !== null){             // survey reveal flood
+    const e = Math.min(1, (performance.now() - revealStart) / 760);
+    progress = 1 - Math.pow(1 - e, 3);
+    if (e >= 1) revealStart = null;
+  }
+  drawWorld(progress);
+
+  const settled = Math.abs(player.x-pr.x) < 0.02 && Math.abs(player.y-pr.y) < 0.02
+    && Math.abs(tgt.x-cam.x) < 0.4 && Math.abs(tgt.y-cam.y) < 0.4 && revealStart === null;
+  if (settled){
+    pr.x = player.x; pr.y = player.y; cam.x = tgt.x; cam.y = tgt.y;
+    drawWorld(1); raf = 0;
+  } else raf = requestAnimationFrame(animate);
+}
+function requestDraw(){ if (!raf) raf = requestAnimationFrame(animate); }
+
+const $ = id => document.getElementById(id);
+let size = 's', showPath = false, zoomUnlock = false;
+
+// ---- run timer + local records ----
+let runStart = null, pausedTotal = 0, pauseStart = 0, splitMs = 0;
+const BEST_KEY = 'dungeon.best.v1';
+function loadBest(){ try { return JSON.parse(localStorage.getItem(BEST_KEY)) || {}; } catch { return {}; } }
+function saveBest(){ try { localStorage.setItem(BEST_KEY, JSON.stringify(best)); } catch {} }
+let best = loadBest();
+function fmtTime(ms){
+  const cs = Math.floor(ms / 10);
+  const m = Math.floor(cs / 6000), s = Math.floor(cs / 100) % 60, c = cs % 100;
+  return `${m}:${String(s).padStart(2,'0')}.${String(c).padStart(2,'0')}`;
+}
+let paused = false, pauseClock = 0;
+function timerNow(){
+  if (won) return splitMs;
+  if (runStart === null) return 0;
+  return (paused ? pauseClock : performance.now()) - runStart - pausedTotal;
+}
+setInterval(() => { $('timer').textContent = fmtTime(timerNow()); }, 33);
+
+function pause(){
+  if (paused || won) return;
+  paused = true; pauseClock = performance.now();
+  stopMoving();
+  $('pauseTime').textContent = fmtTime(timerNow());
+  $('pauseCard').hidden = false;
+}
+function resume(){
+  if (!paused) return;
+  pausedTotal += performance.now() - pauseClock;   // pause time doesn't count
+  paused = false;
+  $('pauseCard').hidden = true;
+}
+function togglePause(){ if (!won) (paused ? resume() : pause()); }
+
+function floorDims(){                       // deeper floors get a bigger grid (zoom is separate)
+  const [bw, bh] = BASE_DIMS;
+  const grow = Math.min(30, (depth - 1) * 4);
+  return [Math.min(81, bw + grow), Math.min(57, bh + Math.round(grow * 0.66))];
+}
+
+function run(seedStr){                      // begin a new run at depth 1
+  baseSeed = (seedStr ?? '').trim() || Math.random().toString(36).slice(2, 9);
+  $('seed').value = baseSeed;
+  depth = 1;
+  runStart = null; pausedTotal = 0;          // clock starts on first step of the run
+  paused = false; $('pauseCard').hidden = true;
+  loadFloor();
+}
+
+function loadFloor(){                        // build / rebuild the current floor
+  const seed = depth === 1 ? baseSeed : `${baseSeed}-${depth}`;   // deterministic run
+  current = generate(seed, floorDims());
+
+  // precompute per-tile reveal time from BFS distance (cell-independent)
+  const bfs = floodFrom(current.entrance);
+  distRef = bfs;
+  revealMap = Array.from({length:current.rowsN}, () => new Array(current.cols).fill(1));
+  for (let y=0;y<current.rowsN;y++) for (let x=0;x<current.cols;x++){
+    if (walkable(x,y)){
+      const dd = bfs.dist.get(key(x,y)) ?? bfs.maxDist;
+      revealMap[y][x] = 0.06 + 0.74 * (dd / (bfs.maxDist || 1));
+    }
+  }
+
+  player = { ...current.entrance };
+  pr = { x: player.x, y: player.y };          // render position starts on the player (no glide-in)
+  seen = new Set(); litSet = new Set();
+  steps = 0; won = false;
+  $('winPlay').textContent = 'Descend ↓';
+  $('winCard').hidden = true;
+
+  measure();
+  if (fog) reveal();                          // light the room you start in
+  cam = camTarget();                          // snap the camera, no slide-in
+  revealStart = (fog || reduceMotion) ? null : performance.now();
+  requestDraw();
+  updateReadout();
+}
+
+function updateReadout(){
+  $('rDepth').textContent = depth;
+  $('rGrid').textContent  = `${current.cols}×${current.rowsN}`;
+  $('rRooms').textContent = current.rooms.length;
+  $('rPath').textContent  = (current.path.length - 1) + ' tiles';
+  $('rSteps').textContent = '0';
+}
+
+$('genBtn').addEventListener('click', () => run($('seed').value));
+$('randBtn').addEventListener('click', () => run(''));   // '' => fresh random seed
+$('seed').addEventListener('keydown', e => { if (e.key === 'Enter') run($('seed').value); });
+
+// ---- play loop: steer the token to the exit ----
+const MOVES = {
+  ArrowUp:[0,-1], KeyW:[0,-1], ArrowDown:[0,1],  KeyS:[0,1],
+  ArrowLeft:[-1,0], KeyA:[-1,0], ArrowRight:[1,0], KeyD:[1,0],
+};
+function move(dx, dy){
+  if (!current || won) return;
+  const nx = player.x + dx, ny = player.y + dy;
+  if (!walkable(nx, ny)) return;                     // walls block
+  if (runStart === null) runStart = performance.now();
+  player.x = nx; player.y = ny; steps++;
+  $('rSteps').textContent = steps;
+  if (fog) reveal();
+  requestDraw();
+  if (nx === current.exit.x && ny === current.exit.y) finish();
+}
+function finish(){
+  won = true;                               // freeze until they descend
+  stopMoving();
+  splitMs = (runStart === null ? 0 : performance.now() - runStart - pausedTotal);
+  pauseStart = performance.now();           // time on the descend card doesn't count
+  const optimal = current.path.length - 1;
+  $('winSteps').textContent = steps;
+  $('winOptimal').textContent = optimal;
+  $('winTag').textContent = `Depth ${depth} cleared`;
+
+  const prev = best[depth];
+  const isBest = prev == null || splitMs < prev;
+  if (isBest){ best[depth] = splitMs; saveBest(); }
+  $('winTime').textContent = fmtTime(splitMs);
+  $('winBest').textContent = fmtTime(best[depth]);
+  $('winBestNote').hidden = !isBest;
+
+  $('winCard').hidden = false;
+}
+// Continuous movement: step on a fixed cadence while a direction key is held.
+let heldKeys = [], moveTimer = 0;
+const STEP_MS = 120;                                  // ms per tile while holding
+function activeDir(){
+  for (let i = heldKeys.length - 1; i >= 0; i--){ const d = MOVES[heldKeys[i]]; if (d) return d; }
+  return null;
+}
+function startMoving(){
+  if (moveTimer) return;
+  const step = () => { const d = activeDir(); if (d) move(d[0], d[1]); else stopMoving(); };
+  step();                                             // immediate first step
+  moveTimer = setInterval(step, STEP_MS);
+}
+function stopMoving(){ clearInterval(moveTimer); moveTimer = 0; heldKeys = []; }
+
+addEventListener('keydown', e => {
+  if (!$('settings').hidden) return;                 // menu open: ignore game keys
+  if (document.activeElement === $('seed')) return;  // don't steal typing
+  if (e.code === 'KeyP' || e.code === 'Escape'){ e.preventDefault(); togglePause(); return; }
+  if (paused) return;                                // paused: ignore movement/zoom
+  if (e.code === 'KeyE'){ if (zoomUnlock){ e.preventDefault(); cycleZoom(); } return; }
+  if (MOVES[e.code]){
+    e.preventDefault();
+    if (!e.repeat && !heldKeys.includes(e.code)){ heldKeys.push(e.code); startMoving(); }
+  }
+});
+addEventListener('keyup', e => {
+  const i = heldKeys.indexOf(e.code);
+  if (i !== -1) heldKeys.splice(i, 1);
+  if (!heldKeys.length) stopMoving();
+});
+addEventListener('blur', stopMoving);                // dropped focus while holding
+// swipe to move on touch devices
+let tsx = 0, tsy = 0;
+addEventListener('touchstart', e => { tsx = e.touches[0].clientX; tsy = e.touches[0].clientY; }, {passive:true});
+addEventListener('touchend', e => {
+  const t = e.changedTouches[0], dx = t.clientX - tsx, dy = t.clientY - tsy;
+  if (Math.hypot(dx, dy) < 24) return;
+  if (Math.abs(dx) > Math.abs(dy)) move(Math.sign(dx), 0);
+  else move(0, Math.sign(dy));
+}, {passive:true});
+$('winPlay').addEventListener('click', () => {
+  pausedTotal += performance.now() - pauseStart;   // exclude time spent on the card
+  depth++; loadFloor();
+});
+$('resumeBtn').addEventListener('click', resume);
+$('pauseNew').addEventListener('click', () => run(''));
+
+$('pathBtn').addEventListener('click', e => {
+  showPath = !showPath;
+  e.currentTarget.setAttribute('aria-pressed', String(showPath));
+  requestDraw();
+});
+
+// ---- settings popover ----
+const setBtn = $('setBtn'), settings = $('settings');
+function openSettings(open){
+  settings.hidden = !open;
+  setBtn.setAttribute('aria-expanded', String(open));
+  if (open){ stopMoving(); selectTab('run'); $('seed').focus(); }
+}
+setBtn.addEventListener('click', e => { e.stopPropagation(); openSettings(settings.hidden); });
+settings.addEventListener('click', e => e.stopPropagation());
+document.addEventListener('click', () => { if (!settings.hidden) openSettings(false); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !settings.hidden) openSettings(false); });
+
+$('copyBtn').addEventListener('click', async e => {
+  if (!current) return;
+  try { await navigator.clipboard.writeText(current.seed); } catch {}
+  const b = e.currentTarget, label = b.textContent;
+  b.textContent = 'Copied'; setTimeout(() => b.textContent = label, 1100);
+});
+
+function setZoom(key){
+  size = key;
+  document.querySelectorAll('.sizes button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.size === key)));
+  if (!current) return;
+  measure();             // zoom only — same floor, same run
+  cam = camTarget();
+  requestDraw();
+}
+function cycleZoom(){
+  const order = ['s','m','l'];
+  setZoom(order[(order.indexOf(size) + 1) % order.length]);
+}
+document.querySelectorAll('.sizes button').forEach(btn =>
+  btn.addEventListener('click', () => setZoom(btn.dataset.size)));
+
+$('zoomUnlock').addEventListener('change', e => { zoomUnlock = e.target.checked; });
+
+// settings tabs
+function selectTab(which){
+  const run = which === 'run';
+  $('tabRun').setAttribute('aria-selected', String(run));
+  $('tabControls').setAttribute('aria-selected', String(!run));
+  $('panelRun').hidden = !run;
+  $('panelControls').hidden = run;
+}
+$('tabRun').addEventListener('click', () => selectTab('run'));
+$('tabControls').addEventListener('click', () => selectTab('controls'));
+
+let resizeT;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { if (current){ measure(); cam = camTarget(); requestDraw(); } }, 120);
+});
+
+// first dungeon on load
+run('');
+</script>
+</body>
+</html>
